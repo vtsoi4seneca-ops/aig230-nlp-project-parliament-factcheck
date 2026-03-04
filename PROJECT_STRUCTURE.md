@@ -24,8 +24,6 @@ parliament-factcheck/\
 │   ├── data_loader.py         # Database interface\
 │   ├── extract_claims.py      # Claim extraction script\
 │   ├── label_claims.py        # CLI labeling tool\
-│   ├── create_synthetic_data.py # Synthetic training data generator\
-│   ├── labeling_tool.py       # Streamlit GUI for labeling\
 │   ├── train.py               # LLM fine-tuning script\
 │   ├── api.py                 # FastAPI inference service\
 │   └── evidence_retriever.py  # Evidence retrieval system\

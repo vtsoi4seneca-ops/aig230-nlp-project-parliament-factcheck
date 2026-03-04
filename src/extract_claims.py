@@ -112,9 +112,10 @@ def main():
     
     print(f'\n💾 Saved {len(all_claims)} claims to {output_path}')
     print('\nNext steps:')
-    print('  1. Label claims: uv run python src/labeling_tool.py')
-    print('  2. Train model: uv run python src/train.py')
-    print('  3. Run API: uv run python src/api.py')
+    print('  1. Preprocessing: uv run python src/preprocess.py')
+    print('  2. Label claims: uv run python src/label_claims.py')
+    print('  3. Train model: uv run python src/train.py')
+    print('  4. Run API: uv run python src/api.py')
 
 
 if __name__ == '__main__':
