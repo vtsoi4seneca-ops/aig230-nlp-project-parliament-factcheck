@@ -1,0 +1,5 @@
+# Export locked dependencies
+uv export --format requirements-txt > requirements.txt
+
+# Or with hashes for security
+uv export --format requirements-txt --locked > requirements-locked.txt

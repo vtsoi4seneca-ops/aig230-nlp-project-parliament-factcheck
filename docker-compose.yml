@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    platform: linux/arm64  # DGX Spark ARM64
+    environment:
+      POSTGRES_USER: spark_user
+      POSTGRES_PASSWORD: secretpassword
+      POSTGRES_DB: spark_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - parliament-net
+
+  factcheck-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.uv  # Updated Dockerfile with uv
+      platforms:
+        - linux/arm64
+    ports:
+      - "8000:8000"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=spark_user
+      - POSTGRES_PASSWORD=secretpassword
+      - POSTGRES_DB=spark_db
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data:ro
+    depends_on:
+      - postgres
+    networks:
+      - parliament-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  postgres_data:
+
+networks:
+  parliament-net:
+    driver: bridge
+
