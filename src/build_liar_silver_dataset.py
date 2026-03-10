@@ -14,7 +14,7 @@ import re
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 import psycopg2
@@ -25,6 +25,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_OUTPUT_DIR = Path("data")
 DEFAULT_INPUTS = [Path("data/processed_claims.json"), Path("data/extracted_claims.json")]
+DEFAULT_EXISTING_SILVER = Path("data/liar_silver_master.csv")
 MASTER_FILENAME = "liar_silver_master.csv"
 TRAINING_FILENAME = "liar_silver_training_pairs.json"
 STATS_FILENAME = "liar_silver_stats.csv"
@@ -52,12 +53,27 @@ FACT_PATTERNS = [
     re.compile(r"\b(unemployment|inflation|gdp|economy|growth|deficit|debt)\b", re.IGNORECASE),
     re.compile(r"\b(bill|legislation|act|law)\b", re.IGNORECASE),
     re.compile(r"\b(voted|vote|supported|opposed|introduced|passed|defeated)\b", re.IGNORECASE),
+    re.compile(r"\b(because of|caused by|thanks to|as a result of|record|highest|lowest|the only|the first|one of|among)\b", re.IGNORECASE),
 ]
 LOW_SIGNAL_PATTERNS = [
     re.compile(r"^\s*(what|why|how)\b", re.IGNORECASE),
     re.compile(r"\b(i think|i believe|we believe|i feel|i hope)\b", re.IGNORECASE),
     re.compile(r"\?$"),
 ]
+MIDDLE_LABEL_CUE_PATTERNS = [
+    re.compile(r"\b(about|around|almost|nearly|roughly)\b", re.IGNORECASE),
+    re.compile(r"\b(more than|less than|over|under)\b", re.IGNORECASE),
+    re.compile(r"\b(record|highest|lowest|always|never|all|none|every)\b", re.IGNORECASE),
+    re.compile(r"\b(one of|among|the only|the first)\b", re.IGNORECASE),
+    re.compile(r"\b(because of|caused by|thanks to|as a result of)\b", re.IGNORECASE),
+]
+BINARY_CLEAN_PATTERNS = [
+    re.compile(r"\bvoted?\s+(for|against)\s+bill\s+[cs]-\d+\b", re.IGNORECASE),
+    re.compile(r"\bbill\s+[cs]-\d+\s+(was|is)\s+(introduced|passed|defeated)\b", re.IGNORECASE),
+]
+LABEL_PRIORITY_VALUES = {"middle_first", "all_labels", "middle_only"}
+MIDDLE_LABELS = {"mostly-true", "half-true", "barely-true", "pants-fire"}
+FALLBACK_LABELS = {"true", "false"}
 
 TRAINING_PROMPT_INSTRUCTIONS = (
     "Provide your answer in this exact format:\n"
@@ -71,10 +87,25 @@ TRAINING_PROMPT_INSTRUCTIONS = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build LIAR-style silver dataset with OpenAI labels.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
-    parser.add_argument("--max-claims", type=int, default=120, help="Maximum number of silver rows to request.")
+    parser.add_argument("--max-claims", type=int, default=900, help="Maximum number of candidate claims to prepare.")
     parser.add_argument("--min-confidence", type=int, default=60)
-    parser.add_argument("--statement-limit", type=int, default=4000, help="DB statement limit if augmentation is needed.")
+    parser.add_argument("--statement-limit", type=int, default=20000, help="DB statement limit if augmentation is needed.")
     parser.add_argument("--start-date", default="2024-01-01", help="Earliest debate date for DB augmentation.")
+    parser.add_argument("--target-new-rows", type=int, default=150, help="Target number of newly accepted silver rows.")
+    parser.add_argument("--max-api-calls", type=int, default=360, help="Maximum number of OpenAI labeling calls.")
+    parser.add_argument(
+        "--label-priority",
+        choices=sorted(LABEL_PRIORITY_VALUES),
+        default="middle_first",
+        help="How to prioritize middle labels versus true/false.",
+    )
+    parser.add_argument(
+        "--exclude-existing-silver",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip claims already present in the current silver master.",
+    )
+    parser.add_argument("--existing-silver-path", default=str(DEFAULT_EXISTING_SILVER))
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=5432)
     parser.add_argument("--database", default="openparliament")
@@ -154,6 +185,22 @@ def claim_is_usable(text: str) -> bool:
     return any(pattern.search(text) for pattern in FACT_PATTERNS)
 
 
+def middle_label_signal_score(text: str) -> int:
+    text = text or ""
+    score = 0
+    for pattern in MIDDLE_LABEL_CUE_PATTERNS:
+        if pattern.search(text):
+            score += 3
+    for pattern in BINARY_CLEAN_PATTERNS:
+        if pattern.search(text):
+            score -= 5
+    if re.search(r"\b\d+(?:\.\d+)?\s*(percent|per cent|million|billion|thousand)\b", text, re.IGNORECASE):
+        score += 2
+    if re.search(r"\b(canadians|families|workers|businesses|people)\b", text, re.IGNORECASE):
+        score += 1
+    return score
+
+
 def split_sentences(text: str) -> List[str]:
     return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text or "") if part.strip()]
 
@@ -224,12 +271,24 @@ def load_seed_claims() -> List[dict]:
     return claims
 
 
-def dedupe_candidates(candidates: Sequence[dict]) -> List[dict]:
+def load_existing_silver_rows(path: Path) -> List[dict]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def existing_claim_keys(rows: Sequence[dict]) -> Set[str]:
+    return {normalize_text(row.get("claim_text", "")) for row in rows if normalize_text(row.get("claim_text", ""))}
+
+
+def dedupe_candidates(candidates: Sequence[dict], excluded_claims: Optional[Set[str]] = None) -> List[dict]:
     seen = set()
     output: List[dict] = []
+    excluded_claims = excluded_claims or set()
     for candidate in candidates:
         key = normalize_text(candidate.get("claim_text", ""))
-        if not key or key in seen:
+        if not key or key in seen or key in excluded_claims:
             continue
         seen.add(key)
         output.append(candidate)
@@ -241,6 +300,14 @@ def select_diverse_candidates(candidates: Sequence[dict], max_claims: int) -> Li
     for candidate in candidates:
         claim_type = candidate.get("claim_type") or "general"
         buckets.setdefault(claim_type, []).append(candidate)
+    for bucket in buckets.values():
+        bucket.sort(
+            key=lambda item: (
+                item.get("candidate_score", 0),
+                len(item.get("claim_text", "")),
+            ),
+            reverse=True,
+        )
 
     selected: List[dict] = []
     claim_types = sorted(buckets)
@@ -258,9 +325,26 @@ def select_diverse_candidates(candidates: Sequence[dict], max_claims: int) -> Li
     return selected
 
 
-def build_candidate_pool(args: argparse.Namespace) -> List[dict]:
+def score_candidate(candidate: dict) -> int:
+    text = candidate.get("claim_text", "")
+    claim_type = candidate.get("claim_type", "general")
+    score = middle_label_signal_score(text)
+    if claim_type in {"economic", "general", "environmental", "health"}:
+        score += 2
+    if claim_type == "vote":
+        score -= 2
+    if claim_type == "legislative":
+        score += 1
+    if re.search(r"\bthis week|today|yesterday|currently|now\b", text, re.IGNORECASE):
+        score += 1
+    return score
+
+
+def build_candidate_pool(args: argparse.Namespace, excluded_claims: Optional[Set[str]] = None) -> List[dict]:
     candidates = [claim for claim in load_seed_claims() if claim_is_usable(claim.get("claim_text", ""))]
-    candidates = dedupe_candidates(candidates)
+    for candidate in candidates:
+        candidate["candidate_score"] = score_candidate(candidate)
+    candidates = dedupe_candidates(candidates, excluded_claims)
     if len(candidates) >= args.max_claims:
         return select_diverse_candidates(candidates, args.max_claims)
 
@@ -285,10 +369,12 @@ def build_candidate_pool(args: argparse.Namespace) -> List[dict]:
                 context,
             )
         )
-        if len(candidates) >= args.max_claims * 3:
+        if len(candidates) >= args.max_claims * 4:
             break
 
-    candidates = dedupe_candidates(candidates)
+    for candidate in candidates:
+        candidate["candidate_score"] = score_candidate(candidate)
+    candidates = dedupe_candidates(candidates, excluded_claims)
     return select_diverse_candidates(candidates, args.max_claims)
 
 
@@ -350,6 +436,7 @@ Return JSON only with this schema:
   "accept": true,
   "label": "true|mostly-true|half-true|barely-true|false|pants-fire",
   "confidence": 0,
+  "not_binary_reason": "why this is not simply true or false",
   "rationale": "short rationale grounded in evidence",
   "evidence_summary": "short evidence summary",
   "used_sources": [
@@ -359,6 +446,21 @@ Return JSON only with this schema:
 
 Reject rows that are mainly rhetorical, too ambiguous, or unsupported. In that case return:
 {{"accept": false, "reason": "brief reason"}}
+
+Label guidance:
+- true: fully supported in all material respects
+- mostly-true: directionally correct, but a minor number, scope, or context detail is off
+- half-true: meaningful mix of supported and contradicted material elements
+- barely-true: a small fragment is true, but the overall claim is materially misleading
+- false: core claim is contradicted
+- pants-fire: false and egregiously misleading or wildly exaggerated
+
+Prefer non-binary labels when the claim is directionally right but numerically off, missing important context, overstated, compressed, or only partly supported.
+Do not default to mostly-true. Use mostly-true only when the error is genuinely minor.
+If the claim contains both important support and important contradiction, prefer half-true.
+If only a narrow fragment is correct but the overall impression is misleading, prefer barely-true.
+For sweeping causal, absolute, or comparative claims, prefer half-true or barely-true over mostly-true when evidence is mixed.
+If you choose mostly-true, half-true, barely-true, or pants-fire, `not_binary_reason` is required.
 
 Claim:
 {candidate.get("claim_text", "")}
@@ -465,6 +567,7 @@ def label_candidate(api_key: str, args: argparse.Namespace, candidate: dict) -> 
 
     label = str(payload.get("label", "")).strip().lower()
     confidence = normalize_confidence(payload.get("confidence"))
+    not_binary_reason = trim_text(payload.get("not_binary_reason", ""), 220)
     rationale = trim_text(payload.get("rationale", ""), 320)
     evidence_summary = trim_text(payload.get("evidence_summary", ""), 420)
     provenance = build_provenance(candidate, payload)
@@ -477,6 +580,8 @@ def label_candidate(api_key: str, args: argparse.Namespace, candidate: dict) -> 
     if not rationale or not evidence_summary:
         return None
     if not has_official_source:
+        return None
+    if label in MIDDLE_LABELS and not not_binary_reason:
         return None
 
     context = candidate.get("context", {})
@@ -498,11 +603,12 @@ def label_candidate(api_key: str, args: argparse.Namespace, candidate: dict) -> 
         "dataset_tier": "silver",
         "label_source": "openai_llm",
         "label_rationale": rationale,
+        "not_binary_reason": not_binary_reason,
         "label_confidence": "" if confidence is None else str(confidence),
         "evidence_text": build_evidence_text(candidate, payload),
         "evidence_provenance_json": json.dumps(provenance, ensure_ascii=False),
         "model_name": model_name or args.model,
-        "prompt_version": "liar_silver_v1",
+        "prompt_version": "liar_silver_v2_middle_first",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "notes": "Silver / LLM-labeled. Non-deterministic.",
     }
@@ -549,6 +655,7 @@ def build_training_pairs(rows: Sequence[dict]) -> List[dict]:
                     "dataset_tier": "silver",
                     "label_source": "openai_llm",
                     "label": row.get("label"),
+                    "not_binary_reason": row.get("not_binary_reason"),
                     "claim_type": row.get("claim_type"),
                     "source_statement_id": row.get("source_statement_id"),
                     "model_name": row.get("model_name"),
@@ -598,18 +705,27 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    existing_silver_path = Path(args.existing_silver_path)
+    existing_rows = load_existing_silver_rows(existing_silver_path) if args.exclude_existing_silver else []
+    excluded_claims = existing_claim_keys(existing_rows) if args.exclude_existing_silver else set()
 
     log("Building silver candidate pool")
-    candidates = build_candidate_pool(args)
+    candidates = build_candidate_pool(args, excluded_claims=excluded_claims)
     for candidate in candidates:
         candidate["source_context_local"] = infer_local_context(candidate.get("full_context", ""), candidate.get("claim_text", ""))
     log(f"Prepared {len(candidates)} candidate claims")
 
-    rows: List[dict] = []
+    middle_rows: List[dict] = []
+    fallback_rows: List[dict] = []
     stats: Counter = Counter()
+    calls_made = 0
     for index, candidate in enumerate(candidates, start=1):
+        if calls_made >= args.max_api_calls:
+            stats["stopped.max_api_calls"] += 1
+            break
         try:
             row = label_candidate(api_key, args, candidate)
+            calls_made += 1
         except Exception as exc:
             stats["skipped.api_error"] += 1
             log(f"Skipping candidate {index} due to API error: {exc}")
@@ -619,9 +735,41 @@ def main() -> None:
             stats["skipped.filtered_or_rejected"] += 1
             continue
 
-        rows.append(row)
+        if row["label"] in MIDDLE_LABELS:
+            middle_rows.append(row)
+        elif row["label"] in FALLBACK_LABELS:
+            fallback_rows.append(row)
+        else:
+            stats["skipped.unknown_label_bucket"] += 1
+            continue
+
+        new_rows_kept = len(middle_rows) + len(fallback_rows)
         if index % args.progress_every == 0 or index == len(candidates):
-            log(f"Labeled {index}/{len(candidates)} candidates, kept {len(rows)} rows")
+            log(
+                f"Labeled {index}/{len(candidates)} candidates, kept {new_rows_kept} new rows "
+                f"({len(middle_rows)} middle, {len(fallback_rows)} fallback)"
+            )
+        if args.label_priority == "middle_only" and len(middle_rows) >= args.target_new_rows:
+            stats["stopped.target_new_rows"] += 1
+            break
+        if args.label_priority in {"middle_first", "all_labels"} and new_rows_kept >= args.target_new_rows:
+            stats["stopped.target_new_rows"] += 1
+            break
+
+    if args.label_priority == "middle_only":
+        new_rows = middle_rows[: args.target_new_rows]
+    elif args.label_priority == "middle_first":
+        needed = max(0, args.target_new_rows - len(middle_rows))
+        new_rows = middle_rows + fallback_rows[:needed]
+    else:
+        new_rows = (middle_rows + fallback_rows)[: args.target_new_rows]
+
+    rows = existing_rows + new_rows
+    stats["overall.existing_rows"] = len(existing_rows)
+    stats["overall.new_rows"] = len(new_rows)
+    stats["overall.middle_rows"] = sum(row.get("label") in MIDDLE_LABELS for row in new_rows)
+    stats["overall.fallback_rows"] = sum(row.get("label") in FALLBACK_LABELS for row in new_rows)
+    stats["overall.api_calls"] = calls_made
 
     write_csv(
         output_dir / MASTER_FILENAME,
@@ -644,6 +792,7 @@ def main() -> None:
             "dataset_tier",
             "label_source",
             "label_rationale",
+            "not_binary_reason",
             "label_confidence",
             "evidence_text",
             "evidence_provenance_json",
