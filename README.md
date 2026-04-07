@@ -13,6 +13,7 @@ The final practical workflow in this repo is: collect claim candidates from parl
 3. Save the final training dataset to [`data/training_pairs.json`](data/training_pairs.json).
 4. Fine-tune the base model with the training notebook or the Python training script.
 5. Convert the merged Hugging Face model to GGUF for downstream inference.
+6. Run GGUF-based inference with the standalone inference script.
 
 ## Dataset
 
@@ -64,6 +65,17 @@ This export path is documented in:
 
 The GGUF conversion step uses `llama.cpp` tooling on the merged fine-tuned model output.
 
+## Inference
+
+The repo also includes a standalone GGUF inference path in [`inference.py`](inference.py).
+
+This script:
+- loads a GGUF model with `llama_cpp`
+- runs inference over a JSON evaluation file such as `send-to-vince.json`
+- writes the generated outputs and metadata to an output JSON file
+
+This is the main lightweight inference path for the current GGUF model flow.
+
 ## Models and Tools Used
 
 - Fine-tuning base model: `meta-llama/Llama-3.1-8B-Instruct`
@@ -71,6 +83,7 @@ The GGUF conversion step uses `llama.cpp` tooling on the merged fine-tuned model
 - Training stack: PyTorch, Transformers, TRL, PEFT, bitsandbytes
 - Data source: local PostgreSQL parliamentary database
 - GGUF export tooling: `llama.cpp`
+- GGUF inference runtime: `llama_cpp`
 
 ## Repo Pointers
 
@@ -78,6 +91,7 @@ The GGUF conversion step uses `llama.cpp` tooling on the merged fine-tuned model
 - [`src/`](src): extraction, dataset-building, and training scripts
 - [`notebooks/`](notebooks): Colab training and GGUF export workflows
 - [`config/model_config.py`](config/model_config.py): core training configuration
+- [`inference.py`](inference.py): standalone GGUF inference script
 
 ## Backend and Frontend Notes
 
@@ -85,11 +99,12 @@ Backend work in this repo mainly covers:
 - dataset-building scripts
 - training scripts and notebooks
 - optional inference scaffolding
+- standalone GGUF inference with `llama_cpp`
 
 No dedicated frontend application is part of the final workflow documented here.
 
 ## Optional / Legacy Notes
 
-Older manual-label and API-serving code still exists in the repo, but it is not the main final workflow described above.
+Older manual-label and API-serving code still exists in the repo, but it is not the only inference path. The newer standalone GGUF inference script is also part of the current repo workflow.
 
 Docker and API files are kept as optional or earlier-stage infrastructure rather than the primary path for reproducing the final project workflow.
