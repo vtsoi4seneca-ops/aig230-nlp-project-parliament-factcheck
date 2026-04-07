@@ -1,5 +1,39 @@
-# Export locked dependencies
-uv export --format requirements-txt > requirements.txt
+# Core ML / training stack
+torch>=2.5.0
+torchvision>=0.20.0
+torchaudio>=2.5.0
+transformers>=4.45.0
+datasets>=3.0.0
+accelerate>=1.0.0
+peft>=0.13.0
+bitsandbytes>=0.44.0
+trl>=0.11.0
 
-# Or with hashes for security
-uv export --format requirements-txt --locked > requirements-locked.txt
+# Data / NLP
+psycopg2-binary>=2.9.9
+sqlalchemy>=2.0.0
+pandas>=2.2.0
+numpy>=1.26.0
+scikit-learn>=1.5.0
+spacy>=3.7.0
+sentencepiece>=0.2.0
+protobuf>=5.28.0
+tqdm>=4.66.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
+
+# API
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+
+# Experiment tracking / notebooks
+wandb>=0.18.0
+tensorboard>=2.18.0
+jupyterlab>=4.2.0
+ipython>=8.29.0
+matplotlib>=3.9.0
+huggingface_hub>=0.27.0
+
+# Labeling UI
+streamlit>=1.40.0
