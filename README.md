@@ -93,6 +93,16 @@ This is the main lightweight inference path for the current GGUF model flow.
 - [`config/model_config.py`](config/model_config.py): core training configuration
 - [`inference.py`](inference.py): standalone GGUF inference script
 
+## Code
+
+The repository is organized around the main stages of the project:
+
+- `data/` contains the datasets used for training and evaluation. The most important file here is `training_pairs.json`, which is the final training set.
+- `src/` contains the pipeline scripts for claim extraction, dataset building, training preparation, and some older optional inference code.
+- `notebooks/` contains the Colab notebooks used for fine-tuning and GGUF export.
+- `config/model_config.py` holds the main training configuration.
+- `inference.py` is the standalone GGUF inference script used after export.
+
 ## Backend and Frontend Notes
 
 Backend work in this repo mainly covers:
